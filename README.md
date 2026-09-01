@@ -160,17 +160,8 @@ The visible script stays readable — the internal preprocessing representation 
 
 ## 🎚️ Rendering workflow
 
-```mermaid
-flowchart LR
-    A[Script] --> B[Delivery tag segmentation]
-    B --> C[Stress + pronunciation preprocessing]
-    C --> D[Selected local TTS engine]
-    D --> E[Variant A]
-    D --> F[Variant B]
-    E --> G[Post-processing]
-    F --> G
-    G --> H[Preview / Save as...]
-```
+**Script** → **Tag segmentation** → **Stress & pronunciation preprocessing** → **Local TTS engine** → **Variant A / Variant B** → **Post-processing** → **Preview or Save as...**
+
 
 For each generation Voxena creates **two variants with different seeds**. You can listen to both immediately, inspect their waveform, save either one, or generate another pair.
 
@@ -308,7 +299,7 @@ Model-specific usage restrictions still apply independently of Voxena.
 ### Voxena
 **Local voices. Multiple engines. One studio.**
 
-[Русская версия](README_RU.md) · [`CHANGELOG.md`](CHANGELOG.md) · [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md)
+[Русская версия](README_RU.md) · [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md)
 
 Made by **Rider**
 
