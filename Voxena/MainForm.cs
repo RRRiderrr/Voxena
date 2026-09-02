@@ -35,13 +35,18 @@ namespace Voxena
         private AppSettings _settings;
         private CancellationTokenSource _operationCts;
         private readonly List<GenerationResult> _lastGenerations=new List<GenerationResult>();
+        private readonly object _engineLineGate=new object();
+        private readonly System.Windows.Forms.Timer _engineLineTimer=new System.Windows.Forms.Timer();
+        private string _pendingEngineLine;
         private bool _webReady,_closing,_voiceDialogOpen;
 
         public MainForm()
         {
             AppPaths.EnsureAll();AppPaths.ClearGeneratedCache();AppPaths.CleanupLegacyPreviewCopies();_settings=_settingsStore.Load();_hardware=HardwareDetector.Detect();_runtime=new RuntimeBootstrapService(_downloads);_models=new ModelManager(_runtime);_voices=new VoiceLibraryService(_models,_runtime);_stress=new RussianStressService(_runtime);_post=new AudioPostProcessor(_runtime);_tts=new TtsEngine(_models,_voices,_runtime,_stress,_post);
             Text="Voxena";Icon=LoadIconSafe();StartPosition=FormStartPosition.CenterScreen;MinimumSize=new Size(1000,700);Size=new Size(1360,880);BackColor=Color.FromArgb(8,12,24);FormBorderStyle=FormBorderStyle.None;KeyPreview=true;
-            _web.Dock=DockStyle.Fill;_web.Margin=Padding.Empty;Controls.Add(_web);Load+=async(s,e)=>await InitializeWebAsync();Shown+=(s,e)=>ApplyNativeTheme();Resize+=(s,e)=>SendWindowState();FormClosing+=OnFormClosing;
+            _web.Dock=DockStyle.Fill;_web.Margin=Padding.Empty;Controls.Add(_web);
+            _engineLineTimer.Interval=125;_engineLineTimer.Tick+=(s,e)=>FlushEngineLine();_engineLineTimer.Start();
+            Load+=async(s,e)=>await InitializeWebAsync();Shown+=(s,e)=>ApplyNativeTheme();Resize+=(s,e)=>SendWindowState();FormClosing+=OnFormClosing;
         }
         protected override void WndProc(ref Message m){if(m.Msg==NativeMethods.WM_NCHITTEST&&WindowState==FormWindowState.Normal){base.WndProc(ref m);if((int)m.Result==1||(int)m.Result==0){int hit=NativeMethods.HitTestResize(this,m.LParam,8);if(hit!=0)m.Result=(IntPtr)hit;}return;}base.WndProc(ref m);}
         private async Task InitializeWebAsync()
@@ -51,11 +56,24 @@ namespace Voxena
         }
         private void CoreWebView2_NavigationStarting(object sender,CoreWebView2NavigationStartingEventArgs e){Uri u;if(!Uri.TryCreate(e.Uri,UriKind.Absolute,out u))return;if(u.Host.Equals("app.voxena",StringComparison.OrdinalIgnoreCase))return;e.Cancel=true;OpenExternal(e.Uri);}
         private void CoreWebView2_NewWindowRequested(object sender,CoreWebView2NewWindowRequestedEventArgs e){e.Handled=true;OpenExternal(e.Uri);}
-        private async void CoreWebView2_WebMessageReceived(object sender,CoreWebView2WebMessageReceivedEventArgs e)
+        private void CoreWebView2_WebMessageReceived(object sender,CoreWebView2WebMessageReceivedEventArgs e)
         {
-            BridgeRequest req=null;try{req=_json.Deserialize<BridgeRequest>(e.WebMessageAsJson);}catch(Exception ex){Logger.Write("Bridge parse error: "+ex.Message);}if(req==null||string.IsNullOrWhiteSpace(req.Action))return;
-            try{
-                switch(req.Action){
+            BridgeRequest req=null;
+            try{req=_json.Deserialize<BridgeRequest>(e.WebMessageAsJson);}
+            catch(Exception ex){Logger.Write("Bridge parse error: "+ex);}
+            if(req==null||string.IsNullOrWhiteSpace(req.Action))return;
+
+            // Do not keep the WebView2 COM callback alive while a model installs for minutes.
+            // Every bridge task owns its exception boundary, so background failures cannot
+            // escape an async-void event and terminate WinForms without a visible error.
+            RunBridgeRequestSafeAsync(req);
+        }
+        private async void RunBridgeRequestSafeAsync(BridgeRequest req)
+        {
+            try
+            {
+                switch(req.Action)
+                {
                     case "appReady":_webReady=true;SendState();SendWindowState();break;
                     case "titlebar":HandleTitlebar(GetString(req.Payload,"command"));break;
                     case "saveSettings":SaveSettingsFromPayload(req.Payload);SendState();break;
@@ -69,8 +87,24 @@ namespace Voxena
                     case "deleteVoice":DeleteVoice(GetString(req.Payload,"id"));break;
                     case "previewVoice":await PreviewVoiceAsync(GetString(req.Payload,"id"));break;
                     case "generate":await GenerateAsync(req.Payload);break;
-                    case "pickOutputFolder":PickOutputFolder();break;case "openOutput":OpenFolder(_settings.OutputFolder);break;case "saveGeneratedAs":SaveGeneratedAs(GetInt(req.Payload,"index",0));break;case "revealGenerated":RevealGenerated(GetInt(req.Payload,"index",0));break;case "openExternal":OpenExternal(GetString(req.Payload,"url"));break;
-                }}catch(Exception ex){Logger.Write("Bridge action failed: "+ex);PostError(ex);}
+                    case "pickOutputFolder":PickOutputFolder();break;
+                    case "openOutput":OpenFolder(_settings.OutputFolder);break;
+                    case "saveGeneratedAs":SaveGeneratedAs(GetInt(req.Payload,"index",0));break;
+                    case "revealGenerated":RevealGenerated(GetInt(req.Payload,"index",0));break;
+                    case "openExternal":OpenExternal(GetString(req.Payload,"url"));break;
+                }
+            }
+            catch(OperationCanceledException)
+            {
+                // Operations that own a cancellation UI handle it themselves. This guard is
+                // for bridge actions that were cancelled before reaching their inner handler.
+                Logger.Write("Bridge action cancelled: "+req.Action);
+            }
+            catch(Exception ex)
+            {
+                Logger.Write("Bridge action failed ("+req.Action+"): "+ex);
+                PostError(ex);
+            }
         }
         private async Task InstallModelsAsync(IEnumerable<string> ids,bool finishFirstRun)
         {
@@ -79,11 +113,18 @@ namespace Voxena
             if(!TryStartOperation("Preparing selected models…"))return;
             try
             {
-                var progress=CreateProgress();Action<string> line=x=>Post("engineLine",new{text=x});
+                Logger.Write("First/setup install started: "+string.Join(", ",list));
+                var progress=CreateProgress();Action<string> line=CreateEngineLineSink();
                 await _models.InstallManyAsync(list,progress,_operationCts.Token,line);
-                Toast("success",list.Count==1?"Model is ready.":"Selected models are ready.");
+                Logger.Write("Model install completed: "+string.Join(", ",list));
+                Toast("success",list.Count==1?Local("Model is ready.","Модель готова.","Модель готова."):Local("Selected models are ready.","Выбранные модели готовы.","Вибрані моделі готові."));
             }
-            catch(OperationCanceledException){Toast("info","Operation cancelled. Downloads can resume later.");}
+            catch(OperationCanceledException){Logger.Write("Model install cancelled.");Toast("info",Local("Operation cancelled. Downloads can resume later.","Операция отменена. Загрузку можно продолжить позже.","Операцію скасовано. Завантаження можна продовжити пізніше."));}
+            catch(Exception ex)
+            {
+                Logger.Write("Model install UI failure: "+ex);
+                PostError(Local("Model installation failed.","Не удалось установить модель.","Не вдалося встановити модель."),ex.ToString());
+            }
             finally
             {
                 // A failed item must not hide models that finished successfully. On first
@@ -134,7 +175,7 @@ namespace Voxena
         }
         private async Task ImportAndPrepareVoiceAsync(string file,string name,string description,string modelId,string transcript)
         {
-            if(!TryStartOperation("Analyzing and caching the new voice…"))return;try{var v=await _voices.ImportAndPrepareAsync(file,name,description,modelId,transcript,CreateProgress(),_operationCts.Token,x=>Post("engineLine",new{text=x}));Post("voiceImported",v);SendState();Toast("success","Voice analyzed and cached locally.");}catch(OperationCanceledException){Toast("info","Voice import cancelled.");}finally{EndOperation();}
+            if(!TryStartOperation("Analyzing and caching the new voice…"))return;try{var v=await _voices.ImportAndPrepareAsync(file,name,description,modelId,transcript,CreateProgress(),_operationCts.Token,CreateEngineLineSink());Post("voiceImported",v);SendState();Toast("success","Voice analyzed and cached locally.");}catch(OperationCanceledException){Toast("info","Voice import cancelled.");}finally{EndOperation();}
         }
         private async Task PreviewVoiceAsync(string id)
         {
@@ -153,7 +194,7 @@ namespace Voxena
                 if(seedB==seedA||seedB==0)seedB=seedA>1?seedA-1:2;
                 _lastGenerations.Clear();
                 Post("generationReset",new{});
-                var results=await _tts.GenerateVariantsAsync(r,_settings,new[]{seedA,seedB},CreateProgress(),_operationCts.Token,x=>Post("engineLine",new{text=x}));
+                var results=await _tts.GenerateVariantsAsync(r,_settings,new[]{seedA,seedB},CreateProgress(),_operationCts.Token,CreateEngineLineSink());
                 var failed=results.FirstOrDefault(x=>x==null||!x.Success);
                 if(failed!=null)
                 {
@@ -181,6 +222,18 @@ namespace Voxena
         private void SaveSettingsFromPayload(Dictionary<string,object> payload){object obj;if(payload==null||!payload.TryGetValue("settings",out obj)||obj==null)return;var updated=_json.Deserialize<AppSettings>(_json.Serialize(obj));if(updated==null)return;if(string.IsNullOrWhiteSpace(updated.OutputFolder))updated.OutputFolder=AppPaths.Output;_settings=updated;_settingsStore.Save(_settings);try{_web.CoreWebView2.Settings.AreDevToolsEnabled=_settings.EnableDevTools;_web.CoreWebView2.Settings.AreBrowserAcceleratorKeysEnabled=_settings.EnableDevTools;}catch{}ApplyNativeTheme();}
         private AppStateDto BuildState(){var profiles=_models.GetProfiles();foreach(var p in profiles)p.Recommended=_hardware.VramMb>0&&_hardware.VramMb>=p.RecommendedVramMb&&(_hardware.VramMb-p.RecommendedVramMb)<5000;return new AppStateDto{Settings=_settings,Hardware=_hardware,Voices=_voices.GetAll(),Profiles=profiles,Version=Application.ProductVersion,StressModelReady=_runtime.StressReady};}
         private void SendState(){if(!_webReady)return;Post("state",new{app=BuildState()});}
+        private Action<string> CreateEngineLineSink(){return QueueEngineLine;}
+        private void QueueEngineLine(string text)
+        {
+            if(_closing||string.IsNullOrWhiteSpace(text))return;
+            lock(_engineLineGate)_pendingEngineLine=text;
+        }
+        private void FlushEngineLine()
+        {
+            string text=null;
+            lock(_engineLineGate){text=_pendingEngineLine;_pendingEngineLine=null;}
+            if(!string.IsNullOrWhiteSpace(text))Post("engineLine",new{text=text});
+        }
         private IProgress<DownloadProgress> CreateProgress(){return new Progress<DownloadProgress>(x=>Post("downloadProgress",x));}
         private bool TryStartOperation(string text){if(_operationCts!=null){Toast("info","Another operation is already running.");return false;}_operationCts=new CancellationTokenSource();Post("busy",new{active=true,text=text});return true;}
         private void EndOperation(){var c=_operationCts;_operationCts=null;try{if(c!=null)c.Dispose();}catch{}Post("busy",new{active=false,text=""});}
@@ -193,7 +246,7 @@ namespace Voxena
         private void SendWindowState(){Post("windowState",new{maximized=WindowState==FormWindowState.Maximized,minimized=WindowState==FormWindowState.Minimized});}
         private void ApplyNativeTheme(){bool dark=!string.Equals(_settings.Theme,"light",StringComparison.OrdinalIgnoreCase);BackColor=dark?Color.FromArgb(8,12,24):Color.FromArgb(245,247,252);NativeMethods.ApplyWindowAppearance(this,dark);}
         private Icon LoadIconSafe(){try{string p=Path.Combine(AppPaths.Assets,"app.ico");return File.Exists(p)?new Icon(p):null;}catch{return null;}}
-        private void OnFormClosing(object sender,FormClosingEventArgs e){_closing=true;try{if(_operationCts!=null)_operationCts.Cancel();}catch{}try{_downloads.Dispose();}catch{}try{AppPaths.ClearGeneratedCache();}catch{}}
+        private void OnFormClosing(object sender,FormClosingEventArgs e){_closing=true;try{_engineLineTimer.Stop();_engineLineTimer.Dispose();}catch{}try{if(_operationCts!=null)_operationCts.Cancel();}catch{}try{_downloads.Dispose();}catch{}try{AppPaths.ClearGeneratedCache();}catch{}}
         private static void OpenExternal(string url){Uri u;if(string.IsNullOrWhiteSpace(url)||!Uri.TryCreate(url,UriKind.Absolute,out u)||(u.Scheme!="http"&&u.Scheme!="https"))return;try{Process.Start(new ProcessStartInfo(u.AbsoluteUri){UseShellExecute=true});}catch{}}
         private static void OpenFolder(string path){if(string.IsNullOrWhiteSpace(path))return;try{Directory.CreateDirectory(path);Process.Start(new ProcessStartInfo(path){UseShellExecute=true});}catch{}}private static void RevealFile(string path){if(string.IsNullOrWhiteSpace(path)||!File.Exists(path))return;try{Process.Start("explorer.exe","/select,"+ProcessRunner.Quote(path));}catch{}}
         private static string MakeRelativePath(string root,string path){Uri a=new Uri(AppendSlash(Path.GetFullPath(root))),b=new Uri(Path.GetFullPath(path));return Uri.UnescapeDataString(a.MakeRelativeUri(b).ToString()).Replace('/',Path.DirectorySeparatorChar);}private static string AppendSlash(string p){return p.EndsWith(Path.DirectorySeparatorChar.ToString())?p:p+Path.DirectorySeparatorChar;}
